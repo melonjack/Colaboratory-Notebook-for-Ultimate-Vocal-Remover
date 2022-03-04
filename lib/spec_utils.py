@@ -8,8 +8,58 @@ import json
 import hashlib
 import threading
 
-from tqdm import tqdm
+def loadWave(inp, mp, hep='none'):
+    X_wave, X_spec_s = {},{}
+    bands_n = len(mp.param['band'])-1
+    X_wave[bands_n+1], _ = librosa.load(
+        inp, mp.param['band'][bands_n+1]['sr'], False, dtype=np.float32, res_type=mp.param['band'][bands_n+1]['res_type'])
+    if X_wave[bands_n+1].ndim == 1:
+        X_wave[bands_n+1] = np.asarray([X_wave[bands_n+1], X_wave[bands_n+1]])
+    X_spec_s[bands_n+1] = wave_to_spectrogram(X_wave[bands_n+1], mp.param['band'][bands_n+1]['hl'], mp.param['band'][bands_n+1]['n_fft'], mp, True)
+    if hep != 'none':
+        input_high_end_h = (mp.param['band'][bands_n+1]['n_fft']//2 - mp.param['band'][bands_n+1]['crop_stop']) + (mp.param['pre_filter_stop'] - mp.param['pre_filter_start'])
+        input_high_end = X_spec_s[bands_n+1][:, mp.param['band'][bands_n+1]['n_fft']//2-input_high_end_h:mp.param['band'][bands_n+1]['n_fft']//2, :]
+    else:
+        input_high_end_h = input_high_end = None
+    for d in range(bands_n, 0, -1):
+        bp = mp.param['band'][d]
+        X_wave[d] = librosa.resample(X_wave[d+1], mp.param['band'][d+1]['sr'], bp['sr'], res_type=bp['res_type'])
+        X_spec_s[d] = wave_to_spectrogram(X_wave[d], bp['hl'], bp['n_fft'], mp, True) # threading true
+    X_spec_m = combine_spectrograms(X_spec_s, mp)
+    del X_wave, X_spec_s
+    return X_spec_m, input_high_end_h, input_high_end
 
+def spec_effects(mp, inp, o, algorithm='invert'):
+    X_spec_m,_,_ = loadWave(inp[0], mp)
+    y_spec_m,_,_ = loadWave(inp[1], mp)
+    c = min(X_spec_m.shape[2],y_spec_m.shape[2])
+    X_spec_m,y_spec_m = X_spec_m[...,:c], y_spec_m[...,:c]
+    if algorithm == 'invert':
+        y_spec_m = reduce_vocal_aggressively(X_spec_m, y_spec_m, 0.2)
+        v_spec_m = X_spec_m - y_spec_m
+    if algorithm == 'min_mag':
+        v_spec_m = np.where(np.abs(X_spec_m) <= np.abs(y_spec_m), X_spec_m, y_spec_m)
+    if algorithm == 'max_mag':
+        v_spec_m = np.where(np.abs(X_spec_m) >= np.abs(y_spec_m), X_spec_m, y_spec_m)
+    if algorithm == 'comb_norm': # debug
+        v_spec_m = X_spec_m + y_spec_m
+    if algorithm == 'mul':
+        s1 = y_spec_m * X_spec_m
+        s2 = .5*(y_spec_m+X_spec_m)
+        v_spec_m = np.divide(s1, s2, out=np.zeros_like(s1), where=s2!=0)
+    if algorithm == 'crossover':
+        freq_to_bin = 2*c/44100
+        bs = int(500*freq_to_bin)
+        be = int(14000 * freq_to_bin)
+        v_spec_m = y_spec_m * get_lp_filter_mask(c, bs, be)+X_spec_m*get_hp_filter_mask(c, be, bs)
+    wave = cmb_spectrogram_to_wave(v_spec_m, mp)
+    if algorithm == 'comb_norm':
+        wave = normalise(wave)
+    sf.write('{}.wav'.format(o), wave, mp.param['sr'])
+
+
+def normalise(wave):
+    return wave / max(np.max(wave), abs(np.min(wave)))
 
 def crop_center(h1, h2):
     h1_shape = h1.size()
@@ -166,9 +216,8 @@ def mask_silence(mag, ref, thres=0.2, min_range=64, fade_size=32):
             old_e = e
 
     return mag
-    
 
-def align_wave_head_and_tail(a, b, sr=0):
+def align_wave_head_and_tail(a, b):
     l = min([a[0].size, b[0].size])
     
     return a[:l,:l], b[:l,:l]
@@ -269,7 +318,7 @@ def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None):
 
     for d in range(1, bands_n + 1):
         bp = mp.param['band'][d]
-        spec_s = np.ndarray(shape=(2, bp['n_fft'] // 2 + 1, spec_m.shape[2]), dtype=complex)
+        spec_s = np.zeros(shape=(2, bp['n_fft'] // 2 + 1, spec_m.shape[2]), dtype=complex)
         h = bp['crop_stop'] - bp['crop_start']
         spec_s[:, bp['crop_start']:bp['crop_stop'], :] = spec_m[:, offset:offset+h, :]
         
@@ -364,6 +413,26 @@ def fft_hp_filter(spec, bin_start, bin_stop):
     spec[:, 0:bin_stop+1, :] *= 0
 
     return spec
+
+# for ensemble
+def get_lp_filter_mask(bins_n, bin_start, bin_stop):
+    mask = np.concatenate([
+        np.ones((bin_start - 1, 1)),
+        np.linspace(1, 0, bin_stop - bin_start + 1)[:, None],
+        np.zeros((bins_n - bin_stop, 1))
+    ], axis=0)
+
+    return mask
+    
+    
+def get_hp_filter_mask(bins_n, bin_start, bin_stop):
+    mask = np.concatenate([
+        np.zeros((bin_stop + 1, 1)),
+        np.linspace(0, 1, 1 + bin_start - bin_stop)[:, None],
+        np.ones((bins_n - bin_start - 2, 1))
+    ], axis=0)
+
+    return mask
 
 def mirroring(a, spec_m, input_high_end, mp):
     if 'mirroring' == a:
